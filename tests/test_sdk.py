@@ -8,3 +8,12 @@ def test_options_command_includes_stream_json():
     assert "--tools" in cmd
     assert "" in cmd
 
+
+def test_console_scripts_declared():
+    import tomllib
+    from pathlib import Path
+
+    data = tomllib.loads(Path("pyproject.toml").read_text())
+    scripts = data["project"]["scripts"]
+    assert scripts["claude-p"] == "claude_p.cli:main"
+    assert scripts["claude-p.py"] == "claude_p.cli:main"
