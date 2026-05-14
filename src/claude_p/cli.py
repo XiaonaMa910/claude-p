@@ -1,0 +1,702 @@
+#!/usr/bin/env python3
+"""Claude Code interactive-TUI backend with `claude -p` compatible output.
+
+This script does not invoke `claude -p`. It starts interactive `claude` under a
+pseudo-TTY, captures the rendered terminal, extracts the assistant answer, and
+emits text/json/stream-json output shaped like `claude -p`.
+
+Compatibility target:
+- Same line-oriented JSON transport.
+- Same core event families: system init, stream_event message_start,
+  content_block_start/delta/stop, assistant, message_delta, message_stop, result.
+- Usage/cost/tool events are best-effort placeholders because the interactive
+  TUI does not expose a machine-readable protocol.
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+from pathlib import Path
+import pty
+import re
+import select
+import signal
+import subprocess
+import sys
+import time
+import uuid
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
+SPINNER_RE = re.compile(r"\n?[✳✶✻✽✢·].*$", re.DOTALL)
+
+
+def warn(message: str) -> None:
+    print(f"claude_tui_agent.py: warning: {message}", file=sys.stderr)
+
+
+def append_flag(cmd: list[str], enabled: bool, flag: str) -> None:
+    if enabled:
+        cmd.append(flag)
+
+
+def append_value(cmd: list[str], flag: str, value: str | None) -> None:
+    if value is not None:
+        cmd.extend([flag, value])
+
+
+def append_optional_value(cmd: list[str], flag: str, value: str | None) -> None:
+    if value is None:
+        return
+    cmd.append(flag)
+    if value:
+        cmd.append(value)
+
+
+def append_repeated_values(cmd: list[str], flag: str, values: list[str] | None) -> None:
+    if not values:
+        return
+    for value in values:
+        cmd.extend([flag, value])
+
+
+def now_ms(start: float) -> int:
+    return int((time.time() - start) * 1000)
+
+
+def emit(obj: dict, enabled: bool = True) -> None:
+    if enabled:
+        print(json.dumps(obj, ensure_ascii=False, separators=(",", ":")), flush=True)
+
+
+def clean_terminal(text: str) -> str:
+    text = OSC_RE.sub("", text)
+    text = ANSI_RE.sub("", text)
+    return text.replace("\r", "").replace("\u00a0", " ")
+
+
+def normalize_answer(text: str) -> str:
+    text = clean_terminal(text)
+    text = SPINNER_RE.sub("", text)
+    # Drop common TUI chrome if it leaked into the block.
+    text = re.split(r"\n?────────────────", text, maxsplit=1)[0]
+    return text.strip()
+
+
+def extract_assistant_snapshot(transcript: str) -> str:
+    clean = clean_terminal(transcript)
+    marker = clean.rfind("⏺")
+    if marker < 0:
+        return ""
+    after = clean[marker + len("⏺") :]
+    return normalize_answer(after)
+
+
+def classify_failure(transcript: str, assistant_text: str, timed_out: bool) -> str | None:
+    if assistant_text:
+        return None
+    low = transcript.lower()
+    if "do you trust" in low or "workspace trust" in low:
+        return "workspace_trust_blocked"
+    if "permission" in low and ("allow" in low or "deny" in low):
+        return "tool_approval_blocked"
+    if timed_out:
+        return "assistant_output_timeout"
+    return "assistant_output_not_found"
+
+
+def build_usage(output_text: str) -> dict:
+    # The TUI does not expose reliable token/cost data. Keep shape-compatible
+    # fields with null/zero values and mark the source in result metadata.
+    approx_output_tokens = max(1, len(output_text.split()))
+    return {
+        "input_tokens": None,
+        "cache_creation_input_tokens": None,
+        "cache_read_input_tokens": None,
+        "output_tokens": approx_output_tokens,
+        "server_tool_use": {"web_search_requests": 0, "web_fetch_requests": 0},
+        "service_tier": None,
+        "cache_creation": {"ephemeral_1h_input_tokens": None, "ephemeral_5m_input_tokens": None},
+        "iterations": [
+            {
+                "input_tokens": None,
+                "output_tokens": approx_output_tokens,
+                "cache_read_input_tokens": None,
+                "cache_creation_input_tokens": None,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": None,
+                    "ephemeral_1h_input_tokens": None,
+                },
+                "type": "message",
+            }
+        ],
+        "speed": None,
+    }
+
+
+def extract_text_from_content(content: object) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts).strip()
+
+
+def canonical_json_if_equivalent(left: str, right: str) -> str | None:
+    try:
+        left_obj = json.loads(left)
+        right_obj = json.loads(right)
+    except json.JSONDecodeError:
+        return None
+    if left_obj != right_obj:
+        return None
+    return json.dumps(right_obj, ensure_ascii=False, separators=(",", ":"))
+
+
+def read_persisted_assistant(session_id: str) -> dict | None:
+    """Read Claude Code's persisted JSONL for exact final assistant text.
+
+    The interactive terminal is a lossy rendering surface: wide glyphs, cursor
+    redraws, and spinner updates can drop or smear characters in the captured
+    TTY transcript. Claude Code still writes the canonical session JSONL for
+    interactive sessions. When available, use it as the source of truth for the
+    final assistant message while keeping the TUI transcript as provenance.
+    """
+    pattern = str(Path.home() / ".claude" / "projects" / "**" / f"{session_id}.jsonl")
+    paths = [Path(p) for p in glob.glob(pattern, recursive=True)]
+    if not paths:
+        return None
+    path = max(paths, key=lambda p: p.stat().st_mtime)
+    latest: dict | None = None
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "assistant":
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict):
+                    continue
+                text = extract_text_from_content(message.get("content"))
+                if not text:
+                    continue
+                latest = {
+                    "path": str(path),
+                    "text": text,
+                    "message": message,
+                    "model": message.get("model"),
+                    "message_id": message.get("id"),
+                    "usage": message.get("usage"),
+                    "stop_reason": message.get("stop_reason"),
+                }
+    except OSError:
+        return None
+    return latest
+
+
+def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int | None, bool, float]:
+    cmd = ["claude", "--session-id", args.session_id]
+
+    # Pass through options that the interactive `claude` entrypoint itself
+    # understands. Print-only options are handled by this wrapper and are not
+    # forwarded.
+    append_repeated_values(cmd, "--add-dir", args.add_dir)
+    append_value(cmd, "--agent", args.agent)
+    append_value(cmd, "--agents", args.agents)
+    append_flag(cmd, args.allow_dangerously_skip_permissions, "--allow-dangerously-skip-permissions")
+    append_repeated_values(cmd, "--allowedTools", args.allowed_tools)
+    append_value(cmd, "--append-system-prompt", args.append_system_prompt)
+    append_repeated_values(cmd, "--betas", args.betas)
+    append_flag(cmd, args.brief, "--brief")
+    append_flag(cmd, args.chrome, "--chrome")
+    append_flag(cmd, args.no_chrome, "--no-chrome")
+    append_flag(cmd, args.continue_session, "--continue")
+    append_flag(cmd, args.dangerously_skip_permissions, "--dangerously-skip-permissions")
+    append_optional_value(cmd, "--debug", args.debug)
+    append_value(cmd, "--debug-file", args.debug_file)
+    append_flag(cmd, args.disable_slash_commands, "--disable-slash-commands")
+    append_repeated_values(cmd, "--disallowedTools", args.disallowed_tools)
+    append_value(cmd, "--effort", args.effort)
+    append_flag(cmd, args.exclude_dynamic_system_prompt_sections, "--exclude-dynamic-system-prompt-sections")
+    append_repeated_values(cmd, "--file", args.files)
+    append_flag(cmd, args.fork_session, "--fork-session")
+    append_optional_value(cmd, "--from-pr", args.from_pr)
+    append_flag(cmd, args.ide, "--ide")
+    append_value(cmd, "--json-schema", args.json_schema)
+    append_repeated_values(cmd, "--mcp-config", args.mcp_config)
+    append_flag(cmd, args.mcp_debug, "--mcp-debug")
+    append_value(cmd, "--tools", args.tools)
+    append_value(cmd, "--model", args.model)
+    append_value(cmd, "--name", args.name)
+    append_value(cmd, "--permission-mode", args.permission_mode)
+    append_repeated_values(cmd, "--plugin-dir", args.plugin_dir)
+    append_value(cmd, "--remote-control-session-name-prefix", args.remote_control_session_name_prefix)
+    append_optional_value(cmd, "--resume", args.resume)
+    append_value(cmd, "--setting-sources", args.setting_sources)
+    append_value(cmd, "--settings", args.settings)
+    append_flag(cmd, args.strict_mcp_config, "--strict-mcp-config")
+    append_value(cmd, "--system-prompt", args.system_prompt)
+    append_optional_value(cmd, "--tmux", args.tmux)
+    append_optional_value(cmd, "--worktree", args.worktree)
+
+    cmd.append(args.prompt)
+    master, slave = pty.openpty()
+    env = {**os.environ, "NO_COLOR": "1", "TERM": args.term}
+    start = time.time()
+    proc = subprocess.Popen(
+        cmd,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        cwd=args.cwd,
+        env=env,
+    )
+    os.close(slave)
+
+    raw = bytearray()
+    last_output = time.time()
+    last_snapshot = ""
+    timed_out = True
+
+    try:
+        while time.time() - start < args.timeout_sec:
+            ready, _, _ = select.select([master], [], [], 0.2)
+            if ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                raw.extend(data)
+                last_output = time.time()
+
+                if args.emit_terminal_delta:
+                    emit(
+                        {
+                            "type": "tui_terminal_delta",
+                            "text": clean_terminal(data.decode("utf-8", "replace")),
+                            "uuid": str(uuid.uuid4()),
+                            "session_id": args.session_id,
+                        },
+                        enabled=stream_json,
+                    )
+
+                snapshot = extract_assistant_snapshot(raw.decode("utf-8", "replace"))
+                if snapshot and snapshot != last_snapshot:
+                    if args.live_tui_deltas:
+                        delta = snapshot[len(last_snapshot) :] if snapshot.startswith(last_snapshot) else snapshot
+                        if delta.strip():
+                            emit(
+                                {
+                                    "type": "stream_event",
+                                    "event": {
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {"type": "text_delta", "text": delta},
+                                    },
+                                    "session_id": args.session_id,
+                                    "parent_tool_use_id": None,
+                                    "uuid": str(uuid.uuid4()),
+                                },
+                                enabled=stream_json,
+                            )
+                    last_snapshot = snapshot
+
+            transcript = raw.decode("utf-8", "replace")
+            if last_snapshot and time.time() - last_output >= args.quiet_after_sec:
+                timed_out = False
+                break
+            if proc.poll() is not None:
+                timed_out = False
+                break
+    finally:
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        os.close(master)
+
+    transcript = clean_terminal(raw.decode("utf-8", "replace"))
+    answer = extract_assistant_snapshot(transcript)
+    return transcript, answer, proc.returncode, timed_out, start
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("prompt", nargs="?")
+    parser.add_argument("--cwd", default=os.getcwd())
+
+    # Common Claude Code options. The goal is CLI compatibility with the print
+    # path while still using the interactive TUI backend internally.
+    parser.add_argument("-p", "--print", dest="print_mode", action="store_true", help="Accepted for claude -p compatibility.")
+    parser.add_argument("--add-dir", action="append", default=[])
+    parser.add_argument("--agent")
+    parser.add_argument("--agents")
+    parser.add_argument("--allow-dangerously-skip-permissions", action="store_true")
+    parser.add_argument("--allowedTools", "--allowed-tools", dest="allowed_tools", action="append", default=[])
+    parser.add_argument("--append-system-prompt")
+    parser.add_argument("--bare", action="store_true")
+    parser.add_argument("--betas", action="append", default=[])
+    parser.add_argument("--brief", action="store_true")
+    parser.add_argument("--chrome", action="store_true")
+    parser.add_argument("--no-chrome", action="store_true")
+    parser.add_argument("-c", "--continue", dest="continue_session", action="store_true")
+    parser.add_argument("--dangerously-skip-permissions", action="store_true")
+    parser.add_argument("-d", "--debug", nargs="?", const="")
+    parser.add_argument("--debug-file")
+    parser.add_argument("--disable-slash-commands", action="store_true")
+    parser.add_argument("--disallowedTools", "--disallowed-tools", dest="disallowed_tools", action="append", default=[])
+    parser.add_argument("--effort")
+    parser.add_argument("--exclude-dynamic-system-prompt-sections", action="store_true")
+    parser.add_argument("--fallback-model")
+    parser.add_argument("--file", dest="files", action="append", default=[])
+    parser.add_argument("--fork-session", action="store_true")
+    parser.add_argument("--from-pr", nargs="?", const="")
+    parser.add_argument("--ide", action="store_true")
+    parser.add_argument("--model", default="sonnet")
+    parser.add_argument("--tools", default="default")
+    parser.add_argument("--permission-mode", default="default")
+    parser.add_argument(
+        "--output-format",
+        choices=["text", "json", "stream-json"],
+        default="text",
+        help="Output format, matching claude -p. Default: text.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Accepted for claude -p CLI compatibility.")
+    parser.add_argument("--include-hook-events", action="store_true")
+    parser.add_argument(
+        "--include-partial-messages",
+        action="store_true",
+        help="Accepted for claude -p CLI compatibility. With the TUI backend, stream-json emits one final text delta by default.",
+    )
+    parser.add_argument("--input-format", choices=["text", "stream-json"], default="text")
+    parser.add_argument("--json-schema")
+    parser.add_argument("--max-budget-usd")
+    parser.add_argument("--mcp-config", action="append", default=[])
+    parser.add_argument("--mcp-debug", action="store_true")
+    parser.add_argument("-n", "--name")
+    parser.add_argument("--no-session-persistence", action="store_true")
+    parser.add_argument("--plugin-dir", action="append", default=[])
+    parser.add_argument("--remote-control-session-name-prefix")
+    parser.add_argument("--replay-user-messages", action="store_true")
+    parser.add_argument("-r", "--resume", nargs="?", const="")
+    parser.add_argument("--setting-sources")
+    parser.add_argument("--settings")
+    parser.add_argument("--strict-mcp-config", action="store_true")
+    parser.add_argument("--system-prompt")
+    parser.add_argument("--tmux", nargs="?", const="")
+    parser.add_argument("-v", "--version", action="store_true")
+    parser.add_argument("-w", "--worktree", nargs="?", const="")
+
+    # Wrapper-only controls.
+    parser.add_argument("--timeout-sec", type=float, default=90)
+    parser.add_argument("--quiet-after-sec", type=float, default=3)
+    parser.add_argument("--session-id", default=str(uuid.uuid4()))
+    parser.add_argument("--term", default="xterm-256color")
+    parser.add_argument("--raw-log")
+    parser.add_argument("--emit-terminal-delta", action="store_true")
+    parser.add_argument(
+        "--live-tui-deltas",
+        action="store_true",
+        help="Emit live text deltas from the lossy TUI surface. Default buffers until persisted JSONL final text is available.",
+    )
+    args = parser.parse_args()
+
+    if args.version:
+        subprocess.run(["claude", "--version"], check=False)
+        return 0
+
+    if args.prompt is None:
+        if sys.stdin.isatty():
+            parser.error("prompt is required unless stdin provides input")
+        args.prompt = sys.stdin.read()
+
+    unsupported: list[str] = []
+    if args.input_format != "text":
+        unsupported.append("--input-format stream-json")
+    if args.replay_user_messages:
+        unsupported.append("--replay-user-messages")
+    if args.no_session_persistence:
+        unsupported.append("--no-session-persistence")
+    if args.bare:
+        unsupported.append("--bare")
+    if args.max_budget_usd:
+        unsupported.append("--max-budget-usd")
+    if args.fallback_model:
+        unsupported.append("--fallback-model")
+    if unsupported:
+        for flag in unsupported:
+            warn(f"{flag} is not supported by the interactive subscription backend; continuing without exact claude -p semantics")
+
+    stream_json = args.output_format == "stream-json"
+    message_id = f"msg_tui_{uuid.uuid4().hex[:24]}"
+    start = time.time()
+
+    emit(
+        {
+            "type": "system",
+            "subtype": "init",
+            "cwd": args.cwd,
+            "session_id": args.session_id,
+            "tools": [],
+            "mcp_servers": [],
+            "model": args.model,
+            "permissionMode": args.permission_mode,
+            "apiKeySource": "interactive_tui_subscription",
+            "claude_code_version": None,
+            "output_style": "default",
+            "uuid": str(uuid.uuid4()),
+            "fast_mode_state": "off",
+        },
+        enabled=stream_json,
+    )
+    emit(
+        {
+            "type": "system",
+            "subtype": "status",
+            "status": "requesting",
+            "uuid": str(uuid.uuid4()),
+            "session_id": args.session_id,
+        },
+        enabled=stream_json,
+    )
+    emit(
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "message_start",
+                "message": {
+                    "model": args.model,
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "stop_details": None,
+                    "usage": {
+                        "input_tokens": None,
+                        "cache_creation_input_tokens": None,
+                        "cache_read_input_tokens": None,
+                        "output_tokens": None,
+                        "service_tier": None,
+                    },
+                },
+            },
+            "session_id": args.session_id,
+            "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()),
+            "ttft_ms": None,
+        },
+        enabled=stream_json,
+    )
+    emit(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            "session_id": args.session_id,
+            "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()),
+        },
+        enabled=stream_json,
+    )
+
+    transcript, tui_answer, exit_code, timed_out, run_start = run_tui(args, stream_json)
+    if args.raw_log:
+        path = Path(args.raw_log)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(transcript)
+
+    persisted = read_persisted_assistant(args.session_id)
+    answer = persisted["text"] if persisted else tui_answer
+    final_answer_source = "session_jsonl" if persisted else "tui_transcript"
+    if persisted and tui_answer and tui_answer != persisted["text"]:
+        canonical = canonical_json_if_equivalent(tui_answer, persisted["text"])
+        if canonical is not None:
+            answer = canonical
+            final_answer_source = "json_canonicalized_from_matching_tui_and_session_jsonl"
+    final_model = persisted.get("model") if persisted else args.model
+    message_id = persisted.get("message_id") if persisted and persisted.get("message_id") else message_id
+
+    if answer and not args.live_tui_deltas:
+        emit(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": answer},
+                },
+                "session_id": args.session_id,
+                "parent_tool_use_id": None,
+                "uuid": str(uuid.uuid4()),
+            },
+            enabled=stream_json,
+        )
+
+    failure = classify_failure(transcript, answer, timed_out)
+    is_error = failure is not None
+    usage = build_usage(answer)
+    duration_ms = now_ms(start)
+
+    if args.output_format == "text":
+        if answer:
+            print(answer)
+        return 0 if not is_error else 2
+
+    if args.output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success" if not is_error else "error",
+                    "is_error": is_error,
+                    "duration_ms": duration_ms,
+                    "duration_api_ms": None,
+                    "num_turns": 1,
+                    "result": answer,
+                    "session_id": args.session_id,
+                    "total_cost_usd": None,
+                    "usage": usage,
+                    "terminal_reason": "completed" if not is_error else failure,
+                    "interactive_tui_backend": {
+                        "raw_log": args.raw_log,
+                        "session_jsonl": persisted.get("path") if persisted else None,
+                        "tui_answer": tui_answer,
+                        "final_answer_source": final_answer_source,
+                        "timed_out": timed_out,
+                        "exit_code": exit_code,
+                        "extraction_confidence": "high" if persisted else ("medium" if answer else "none"),
+                    },
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+        return 0 if not is_error else 2
+
+    emit(
+        {
+            "type": "assistant",
+            "message": {
+                "model": final_model,
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": answer}] if answer else [],
+                "stop_reason": "end_turn" if not is_error else None,
+                "stop_sequence": None,
+                "stop_details": None,
+                "usage": {
+                    "input_tokens": None,
+                    "cache_creation_input_tokens": None,
+                    "cache_read_input_tokens": None,
+                    "output_tokens": usage["output_tokens"],
+                    "service_tier": None,
+                },
+                "context_management": None,
+            },
+            "parent_tool_use_id": None,
+            "session_id": args.session_id,
+            "uuid": str(uuid.uuid4()),
+        }
+    )
+    emit(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 0},
+            "session_id": args.session_id,
+            "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()),
+        }
+    )
+    emit(
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn" if not is_error else "error", "stop_sequence": None, "stop_details": None},
+                "usage": {
+                    "input_tokens": None,
+                    "cache_creation_input_tokens": None,
+                    "cache_read_input_tokens": None,
+                    "output_tokens": usage["output_tokens"],
+                    "iterations": usage["iterations"],
+                },
+                "context_management": {"applied_edits": []},
+            },
+            "session_id": args.session_id,
+            "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()),
+        }
+    )
+    emit(
+        {
+            "type": "stream_event",
+            "event": {"type": "message_stop"},
+            "session_id": args.session_id,
+            "parent_tool_use_id": None,
+            "uuid": str(uuid.uuid4()),
+        }
+    )
+    emit(
+        {
+            "type": "rate_limit_event",
+            "rate_limit_info": {"status": "unknown"},
+            "session_id": args.session_id,
+            "uuid": str(uuid.uuid4()),
+        }
+    )
+    emit(
+        {
+            "type": "result",
+            "subtype": "success" if not is_error else "error",
+            "is_error": is_error,
+            "api_error_status": None,
+            "duration_ms": duration_ms,
+            "duration_api_ms": None,
+            "num_turns": 1,
+            "result": answer,
+            "stop_reason": "end_turn" if not is_error else None,
+            "session_id": args.session_id,
+            "total_cost_usd": None,
+            "usage": usage,
+            "modelUsage": {},
+            "permission_denials": [],
+            "terminal_reason": "completed" if not is_error else failure,
+            "fast_mode_state": "off",
+            "uuid": str(uuid.uuid4()),
+            "interactive_tui_backend": {
+                "raw_log": args.raw_log,
+                "session_jsonl": persisted.get("path") if persisted else None,
+                "tui_answer": tui_answer,
+                "final_answer_source": final_answer_source,
+                "timed_out": timed_out,
+                "exit_code": exit_code,
+                "extraction_confidence": "high" if persisted else ("medium" if answer else "none"),
+                "compatibility_note": "Shape-compatible with claude -p stream-json core events; usage/cost/tool events are best-effort because TUI has no machine protocol.",
+            },
+        }
+    )
+
+    return 0 if not is_error else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
