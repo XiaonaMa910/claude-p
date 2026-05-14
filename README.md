@@ -43,6 +43,8 @@ pip install claude-p
 claude-p "Write a Python function that reverses a string"
 ```
 
+![claude-p CLI demo](assets/claude-p-cli.gif)
+
 Default output is plain text, just like `claude -p`.
 
 Structured outputs work too:
@@ -102,6 +104,8 @@ asyncio.run(main())
 ```
 
 For a single final result:
+
+![claude-p Python SDK demo](assets/claude-p-sdk.gif)
 
 ```python
 import asyncio
