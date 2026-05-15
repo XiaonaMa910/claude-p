@@ -23,6 +23,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -97,9 +98,11 @@ def extract_assistant_snapshot(transcript: str) -> str:
 
 
 def classify_failure(transcript: str, assistant_text: str, timed_out: bool) -> str | None:
+    low = f"{transcript}\n{assistant_text}".lower()
+    if "you've hit your limit" in low or "you have hit your limit" in low or "hit your limit" in low:
+        return "rate_limit"
     if assistant_text:
         return None
-    low = transcript.lower()
     if "do you trust" in low or "workspace trust" in low:
         return "workspace_trust_blocked"
     if "permission" in low and ("allow" in low or "deny" in low):
@@ -337,6 +340,43 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     return transcript, answer, proc.returncode, timed_out, start
 
 
+def doctor(args: argparse.Namespace) -> int:
+    """Print diagnostics that explain most installation and local CLI failures."""
+    print("claude-p doctor")
+    print(f"invoked_as: {sys.argv[0]}")
+    print(f"python: {sys.executable}")
+    print(f"python_version: {sys.version.split()[0]}")
+    print(f"cwd: {args.cwd}")
+    print(f"home: {Path.home()}")
+
+    claude_path = shutil.which("claude")
+    print(f"claude_path: {claude_path or 'not found'}")
+    if claude_path:
+        try:
+            proc = subprocess.run(
+                ["claude", "--version"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            version = (proc.stdout or proc.stderr).strip()
+            print(f"claude_version: {version or 'unknown'}")
+        except Exception as exc:  # pragma: no cover - defensive diagnostic path.
+            print(f"claude_version_error: {exc}")
+
+    session_root = Path.home() / ".claude" / "projects"
+    print(f"session_root: {session_root}")
+    print(f"session_root_exists: {session_root.exists()}")
+    print(f"session_root_writable: {os.access(session_root, os.W_OK) if session_root.exists() else False}")
+
+    claude_p_path = shutil.which("claude-p")
+    print(f"claude_p_path: {claude_p_path or 'not found'}")
+    print("smoke_test:")
+    print('  claude-p "Respond exactly: CLAUDE_P_OK" --timeout-sec 45 --quiet-after-sec 2 --raw-log /tmp/claude-p-smoke.raw.log')
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("prompt", nargs="?")
@@ -410,6 +450,11 @@ def main() -> int:
     parser.add_argument("--session-id", default=str(uuid.uuid4()))
     parser.add_argument("--term", default="xterm-256color")
     parser.add_argument("--raw-log")
+    parser.add_argument(
+        "--doctor",
+        action="store_true",
+        help="Print local installation diagnostics without calling the model.",
+    )
     parser.add_argument("--emit-terminal-delta", action="store_true")
     parser.add_argument(
         "--live-tui-deltas",
@@ -417,6 +462,9 @@ def main() -> int:
         help="Emit live text deltas from the lossy TUI surface. Default buffers until persisted JSONL final text is available.",
     )
     args = parser.parse_args()
+
+    if args.doctor:
+        return doctor(args)
 
     if args.version:
         subprocess.run(["claude", "--version"], check=False)
@@ -556,7 +604,15 @@ def main() -> int:
     duration_ms = now_ms(start)
 
     if args.output_format == "text":
-        if answer:
+        if is_error:
+            if answer:
+                print(answer, file=sys.stderr)
+            print(
+                f"claude-p error: {failure}. "
+                "Run with --raw-log /tmp/claude-p.raw.log and inspect the log if this is unexpected.",
+                file=sys.stderr,
+            )
+        elif answer:
             print(answer)
         return 0 if not is_error else 2
 
