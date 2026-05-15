@@ -272,10 +272,12 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     raw = bytearray()
     last_output = time.time()
     last_snapshot = ""
+    last_jsonl_poll = 0.0
     timed_out = True
 
     try:
         while time.time() - start < args.timeout_sec:
+            now = time.time()
             ready, _, _ = select.select([master], [], [], 0.2)
             if ready:
                 try:
@@ -320,6 +322,19 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                     last_snapshot = snapshot
 
             transcript = raw.decode("utf-8", "replace")
+
+            # The terminal surface is not a stable completion signal across
+            # Claude Code versions and terminal modes. Poll the canonical
+            # session JSONL while the TUI is running, and finish as soon as the
+            # current session has an assistant message. This is the same source
+            # of truth used for the final answer below.
+            if now - last_jsonl_poll >= 0.5:
+                last_jsonl_poll = now
+                persisted = read_persisted_assistant(args.session_id)
+                if persisted and persisted.get("text"):
+                    timed_out = False
+                    break
+
             if last_snapshot and time.time() - last_output >= args.quiet_after_sec:
                 timed_out = False
                 break
