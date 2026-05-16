@@ -34,6 +34,21 @@ import uuid
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 SPINNER_RE = re.compile(r"\n?[✳✶✻✽✢·].*$", re.DOTALL)
+NON_TERMINAL_STOP_REASONS = {"tool_use", "pause_turn"}
+SUBSCRIPTION_BACKEND_ENV_OVERRIDES = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+)
+VARIADIC_PROMPT_ATTRS = (
+    "tools",
+    "allowed_tools",
+    "disallowed_tools",
+    "add_dir",
+    "files",
+    "mcp_config",
+    "betas",
+)
 
 
 def warn(message: str) -> None:
@@ -59,10 +74,19 @@ def append_optional_value(cmd: list[str], flag: str, value: str | None) -> None:
 
 
 def append_repeated_values(cmd: list[str], flag: str, values: list[str] | None) -> None:
+    values = flatten_cli_values(values)
     if not values:
         return
     for value in values:
         cmd.extend([flag, value])
+
+
+def append_variadic_values(cmd: list[str], flag: str, values: list[str] | None) -> None:
+    values = flatten_cli_values(values)
+    if not values:
+        return
+    cmd.append(flag)
+    cmd.extend(values)
 
 
 def now_ms(start: float) -> int:
@@ -78,6 +102,45 @@ def clean_terminal(text: str) -> str:
     text = OSC_RE.sub("", text)
     text = ANSI_RE.sub("", text)
     return text.replace("\r", "").replace("\u00a0", " ")
+
+
+def compact_for_detection(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", clean_terminal(text).lower())
+
+
+def flatten_cli_values(values: object) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, str):
+        return [values]
+    flattened: list[str] = []
+    for value in values:
+        if isinstance(value, str):
+            flattened.append(value)
+        elif isinstance(value, (list, tuple)):
+            flattened.extend(str(item) for item in value)
+        else:
+            flattened.append(str(value))
+    return flattened
+
+
+def recover_prompt_from_variadic_args(args: argparse.Namespace) -> None:
+    """Recover prompt-last invocations after argparse variadic option capture.
+
+    Claude's CLI accepts options such as `--tools Bash Edit` as variadic lists,
+    while this wrapper also accepts a free-form positional prompt. Argparse has
+    no way to know where a variadic option ends when the prompt is last, so if
+    no prompt was parsed and stdin is interactive, treat the final captured
+    variadic token as the prompt.
+    """
+    if args.prompt is not None or not sys.stdin.isatty():
+        return
+    for attr in VARIADIC_PROMPT_ATTRS:
+        values = flatten_cli_values(getattr(args, attr, None))
+        if len(values) > 1:
+            args.prompt = values.pop()
+            setattr(args, attr, values)
+            return
 
 
 def normalize_answer(text: str) -> str:
@@ -98,18 +161,32 @@ def extract_assistant_snapshot(transcript: str) -> str:
 
 
 def classify_failure(transcript: str, assistant_text: str, timed_out: bool) -> str | None:
-    low = f"{transcript}\n{assistant_text}".lower()
-    if "you've hit your limit" in low or "you have hit your limit" in low or "hit your limit" in low:
-        return "rate_limit"
+    interactive_block = classify_interactive_block(f"{transcript}\n{assistant_text}")
+    if interactive_block:
+        return interactive_block
     if assistant_text:
         return None
-    if "do you trust" in low or "workspace trust" in low:
-        return "workspace_trust_blocked"
-    if "permission" in low and ("allow" in low or "deny" in low):
-        return "tool_approval_blocked"
     if timed_out:
         return "assistant_output_timeout"
     return "assistant_output_not_found"
+
+
+def classify_interactive_block(text: str) -> str | None:
+    low = clean_terminal(text).lower()
+    compact = compact_for_detection(text)
+    if "failed to authenticate" in low or "api error: 403" in low or "pleaserunlogin" in compact:
+        return "auth_blocked"
+    if "you've hit your limit" in low or "you have hit your limit" in low or "hit your limit" in low:
+        return "rate_limit"
+    if (
+        ("do you trust" in low and "folder" in low)
+        or "workspacetrust" in compact
+        or ("quicksafetycheck" in compact and ("itrustthisfolder" in compact or "accessingworkspace" in compact))
+    ):
+        return "workspace_trust_blocked"
+    if "permission" in low and ("allow" in low or "deny" in low):
+        return "tool_approval_blocked"
+    return None
 
 
 def build_usage(output_text: str) -> dict:
@@ -141,6 +218,14 @@ def build_usage(output_text: str) -> dict:
     }
 
 
+def build_tui_env(args: argparse.Namespace) -> dict[str, str]:
+    env = {**os.environ, "NO_COLOR": "1", "TERM": args.term}
+    if not args.preserve_provider_env:
+        for name in SUBSCRIPTION_BACKEND_ENV_OVERRIDES:
+            env.pop(name, None)
+    return env
+
+
 def extract_text_from_content(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -166,7 +251,12 @@ def canonical_json_if_equivalent(left: str, right: str) -> str | None:
     return json.dumps(right_obj, ensure_ascii=False, separators=(",", ":"))
 
 
-def read_persisted_assistant(session_id: str) -> dict | None:
+def is_terminal_assistant_message(message: dict) -> bool:
+    stop_reason = message.get("stop_reason")
+    return stop_reason is not None and stop_reason not in NON_TERMINAL_STOP_REASONS
+
+
+def read_persisted_assistant(session_id: str, *, require_terminal: bool = False) -> dict | None:
     """Read Claude Code's persisted JSONL for exact final assistant text.
 
     The interactive terminal is a lossy rendering surface: wide glyphs, cursor
@@ -196,6 +286,9 @@ def read_persisted_assistant(session_id: str) -> dict | None:
                 text = extract_text_from_content(message.get("content"))
                 if not text:
                     continue
+                terminal = is_terminal_assistant_message(message)
+                if require_terminal and not terminal:
+                    continue
                 latest = {
                     "path": str(path),
                     "text": text,
@@ -204,6 +297,7 @@ def read_persisted_assistant(session_id: str) -> dict | None:
                     "message_id": message.get("id"),
                     "usage": message.get("usage"),
                     "stop_reason": message.get("stop_reason"),
+                    "terminal": terminal,
                 }
     except OSError:
         return None
@@ -216,13 +310,13 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     # Pass through options that the interactive `claude` entrypoint itself
     # understands. Print-only options are handled by this wrapper and are not
     # forwarded.
-    append_repeated_values(cmd, "--add-dir", args.add_dir)
+    append_variadic_values(cmd, "--add-dir", args.add_dir)
     append_value(cmd, "--agent", args.agent)
     append_value(cmd, "--agents", args.agents)
     append_flag(cmd, args.allow_dangerously_skip_permissions, "--allow-dangerously-skip-permissions")
-    append_repeated_values(cmd, "--allowedTools", args.allowed_tools)
+    append_variadic_values(cmd, "--allowedTools", args.allowed_tools)
     append_value(cmd, "--append-system-prompt", args.append_system_prompt)
-    append_repeated_values(cmd, "--betas", args.betas)
+    append_variadic_values(cmd, "--betas", args.betas)
     append_flag(cmd, args.brief, "--brief")
     append_flag(cmd, args.chrome, "--chrome")
     append_flag(cmd, args.no_chrome, "--no-chrome")
@@ -231,21 +325,23 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     append_optional_value(cmd, "--debug", args.debug)
     append_value(cmd, "--debug-file", args.debug_file)
     append_flag(cmd, args.disable_slash_commands, "--disable-slash-commands")
-    append_repeated_values(cmd, "--disallowedTools", args.disallowed_tools)
+    append_variadic_values(cmd, "--disallowedTools", args.disallowed_tools)
     append_value(cmd, "--effort", args.effort)
     append_flag(cmd, args.exclude_dynamic_system_prompt_sections, "--exclude-dynamic-system-prompt-sections")
-    append_repeated_values(cmd, "--file", args.files)
+    append_variadic_values(cmd, "--file", args.files)
     append_flag(cmd, args.fork_session, "--fork-session")
     append_optional_value(cmd, "--from-pr", args.from_pr)
     append_flag(cmd, args.ide, "--ide")
     append_value(cmd, "--json-schema", args.json_schema)
-    append_repeated_values(cmd, "--mcp-config", args.mcp_config)
+    append_variadic_values(cmd, "--mcp-config", args.mcp_config)
     append_flag(cmd, args.mcp_debug, "--mcp-debug")
-    append_value(cmd, "--tools", args.tools)
+    append_variadic_values(cmd, "--tools", args.tools)
     append_value(cmd, "--model", args.model)
     append_value(cmd, "--name", args.name)
     append_value(cmd, "--permission-mode", args.permission_mode)
     append_repeated_values(cmd, "--plugin-dir", args.plugin_dir)
+    append_repeated_values(cmd, "--plugin-url", args.plugin_url)
+    append_optional_value(cmd, "--remote-control", args.remote_control)
     append_value(cmd, "--remote-control-session-name-prefix", args.remote_control_session_name_prefix)
     append_optional_value(cmd, "--resume", args.resume)
     append_value(cmd, "--setting-sources", args.setting_sources)
@@ -257,7 +353,7 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
 
     cmd.append(args.prompt)
     master, slave = pty.openpty()
-    env = {**os.environ, "NO_COLOR": "1", "TERM": args.term}
+    env = build_tui_env(args)
     start = time.time()
     proc = subprocess.Popen(
         cmd,
@@ -322,22 +418,27 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
                     last_snapshot = snapshot
 
             transcript = raw.decode("utf-8", "replace")
+            if classify_interactive_block(transcript):
+                timed_out = False
+                break
 
             # The terminal surface is not a stable completion signal across
             # Claude Code versions and terminal modes. Poll the canonical
-            # session JSONL while the TUI is running, and finish as soon as the
-            # current session has an assistant message. This is the same source
-            # of truth used for the final answer below.
+            # session JSONL while the TUI is running, and finish only after the
+            # current session has a terminal assistant message. Tool-use turns
+            # can also contain text and must not be mistaken for final output.
             if now - last_jsonl_poll >= 0.5:
                 last_jsonl_poll = now
                 persisted = read_persisted_assistant(args.session_id)
-                if persisted and persisted.get("text"):
+                if persisted and persisted.get("text") and persisted.get("terminal"):
                     timed_out = False
                     break
 
             if last_snapshot and time.time() - last_output >= args.quiet_after_sec:
-                timed_out = False
-                break
+                persisted = read_persisted_assistant(args.session_id)
+                if not persisted or persisted.get("terminal"):
+                    timed_out = False
+                    break
             if proc.poll() is not None:
                 timed_out = False
                 break
@@ -387,6 +488,9 @@ def doctor(args: argparse.Namespace) -> int:
 
     claude_p_path = shutil.which("claude-p")
     print(f"claude_p_path: {claude_p_path or 'not found'}")
+    present_overrides = [name for name in SUBSCRIPTION_BACKEND_ENV_OVERRIDES if os.environ.get(name)]
+    print(f"provider_env_overrides_present: {','.join(present_overrides) if present_overrides else 'none'}")
+    print(f"provider_env_policy: {'preserve' if args.preserve_provider_env else 'strip_for_subscription_backend'}")
     print("smoke_test:")
     print('  claude-p "Respond exactly: CLAUDE_P_OK" --timeout-sec 45 --quiet-after-sec 2 --raw-log /tmp/claude-p-smoke.raw.log')
     return 0
@@ -400,14 +504,14 @@ def main() -> int:
     # Common Claude Code options. The goal is CLI compatibility with the print
     # path while still using the interactive TUI backend internally.
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true", help="Accepted for claude -p compatibility.")
-    parser.add_argument("--add-dir", action="append", default=[])
+    parser.add_argument("--add-dir", nargs="+", action="append", default=[])
     parser.add_argument("--agent")
     parser.add_argument("--agents")
     parser.add_argument("--allow-dangerously-skip-permissions", action="store_true")
-    parser.add_argument("--allowedTools", "--allowed-tools", dest="allowed_tools", action="append", default=[])
+    parser.add_argument("--allowedTools", "--allowed-tools", dest="allowed_tools", nargs="+", action="append", default=[])
     parser.add_argument("--append-system-prompt")
     parser.add_argument("--bare", action="store_true")
-    parser.add_argument("--betas", action="append", default=[])
+    parser.add_argument("--betas", nargs="+", action="append", default=[])
     parser.add_argument("--brief", action="store_true")
     parser.add_argument("--chrome", action="store_true")
     parser.add_argument("--no-chrome", action="store_true")
@@ -416,16 +520,16 @@ def main() -> int:
     parser.add_argument("-d", "--debug", nargs="?", const="")
     parser.add_argument("--debug-file")
     parser.add_argument("--disable-slash-commands", action="store_true")
-    parser.add_argument("--disallowedTools", "--disallowed-tools", dest="disallowed_tools", action="append", default=[])
+    parser.add_argument("--disallowedTools", "--disallowed-tools", dest="disallowed_tools", nargs="+", action="append", default=[])
     parser.add_argument("--effort")
     parser.add_argument("--exclude-dynamic-system-prompt-sections", action="store_true")
     parser.add_argument("--fallback-model")
-    parser.add_argument("--file", dest="files", action="append", default=[])
+    parser.add_argument("--file", dest="files", nargs="+", action="append", default=[])
     parser.add_argument("--fork-session", action="store_true")
     parser.add_argument("--from-pr", nargs="?", const="")
     parser.add_argument("--ide", action="store_true")
     parser.add_argument("--model", default="sonnet")
-    parser.add_argument("--tools", default="default")
+    parser.add_argument("--tools", nargs="+", default=["default"])
     parser.add_argument("--permission-mode", default="default")
     parser.add_argument(
         "--output-format",
@@ -443,11 +547,13 @@ def main() -> int:
     parser.add_argument("--input-format", choices=["text", "stream-json"], default="text")
     parser.add_argument("--json-schema")
     parser.add_argument("--max-budget-usd")
-    parser.add_argument("--mcp-config", action="append", default=[])
+    parser.add_argument("--mcp-config", nargs="+", action="append", default=[])
     parser.add_argument("--mcp-debug", action="store_true")
     parser.add_argument("-n", "--name")
     parser.add_argument("--no-session-persistence", action="store_true")
     parser.add_argument("--plugin-dir", action="append", default=[])
+    parser.add_argument("--plugin-url", action="append", default=[])
+    parser.add_argument("--remote-control", nargs="?", const="")
     parser.add_argument("--remote-control-session-name-prefix")
     parser.add_argument("--replay-user-messages", action="store_true")
     parser.add_argument("-r", "--resume", nargs="?", const="")
@@ -466,6 +572,11 @@ def main() -> int:
     parser.add_argument("--term", default="xterm-256color")
     parser.add_argument("--raw-log")
     parser.add_argument(
+        "--preserve-provider-env",
+        action="store_true",
+        help="Preserve Anthropic API/provider environment variables instead of stripping them for the subscription-backed TUI.",
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Print local installation diagnostics without calling the model.",
@@ -477,6 +588,7 @@ def main() -> int:
         help="Emit live text deltas from the lossy TUI surface. Default buffers until persisted JSONL final text is available.",
     )
     args = parser.parse_args()
+    recover_prompt_from_variadic_args(args)
 
     if args.doctor:
         return doctor(args)
@@ -586,7 +698,7 @@ def main() -> int:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(transcript)
 
-    persisted = read_persisted_assistant(args.session_id)
+    persisted = read_persisted_assistant(args.session_id, require_terminal=True)
     answer = persisted["text"] if persisted else tui_answer
     final_answer_source = "session_jsonl" if persisted else "tui_transcript"
     if persisted and tui_answer and tui_answer != persisted["text"]:
