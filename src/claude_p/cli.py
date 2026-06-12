@@ -749,7 +749,11 @@ def main() -> int:
     parser.add_argument("--fork-session", action="store_true")
     parser.add_argument("--from-pr", nargs="?", const="")
     parser.add_argument("--ide", action="store_true")
-    parser.add_argument("--model", default="sonnet")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="Model to use. Default: your Claude Code account's default model, matching native claude -p (upstream forced sonnet).",
+    )
     parser.add_argument("--tools", nargs="+", default=["default"])
     parser.add_argument("--permission-mode", default="default")
     parser.add_argument(
