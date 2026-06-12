@@ -221,7 +221,10 @@ Anthropic API.
 
 Current limits:
 
-- Token usage, cost, and exact rate-limit fields are best-effort placeholders.
+- Token usage, cost, model and rate-limit fields carry real values read from
+  Claude Code's session JSONL and statusline payload (see "About this fork").
+  If those local data sources are unavailable, the fields fall back to `null`.
+- Tool-use events are not replayed into the stream.
 - Hook lifecycle events from `claude -p --include-hook-events` are not replayed yet.
 - `--input-format stream-json` is accepted but not implemented.
 - `--bare` conflicts with the subscription-login goal because Claude bare mode
@@ -366,12 +369,13 @@ python -m venv /tmp/claude-p-smoke
 /tmp/claude-p-smoke/bin/claude-p "Respond exactly: SMOKE_OK" --tools ''
 ```
 
-Release:
+Release (this fork):
 
-1. Merge feature branch into `dev`.
-2. Open PR from `dev` to `main`.
-3. After merge, create a GitHub release tag, for example `v0.1.1`.
-4. The `publish.yml` workflow publishes to PyPI when PyPI Trusted Publishing is configured.
+1. Commit to `main` and push to GitHub — that is the release.
+2. Consumers update with
+   `python3 -m pip install --upgrade --force-reinstall "git+https://github.com/XiaonaMa910/claude-p.git"`.
+3. Optionally tag stable points (`git tag v0.1.4-mm1 && git push origin --tags`)
+   and pin installs to a tag for reproducible CI.
 
 ## 中文说明
 
@@ -572,7 +576,9 @@ spinner、宽字符和 redraw 都可能让捕获文本丢字。Claude Code 的 s
 
 当前限制：
 
-- token usage、cost、rate-limit 字段是 best-effort placeholder；
+- token usage、cost、模型号、rate-limit 字段携带真实值（来自 Claude Code 的会话
+  JSONL 与 statusline payload，见"关于本 Fork"）；本地数据源不可用时回退为 `null`；
+- tool-use 事件不会回放到输出流中；
 - 暂不回放 `claude -p --include-hook-events` 的 hook lifecycle events；
 - 接受 `--input-format stream-json` 参数，但尚未实现；
 - `--bare` 与订阅登录态目标冲突，因为 Claude bare mode 会绕过 OAuth/keychain auth；
@@ -708,12 +714,12 @@ python -m venv /tmp/claude-p-smoke
 /tmp/claude-p-smoke/bin/claude-p "Respond exactly: SMOKE_OK" --tools ''
 ```
 
-发布流程：
+发布流程（本 fork）：
 
-1. 将 feature branch 合并到 `dev`；
-2. 从 `dev` 向 `main` 开 PR；
-3. 合并后创建 GitHub release tag，例如 `v0.1.1`；
-4. 如果 PyPI Trusted Publishing 已配置，`publish.yml` workflow 会自动发布到 PyPI。
+1. 提交到 `main` 并推送 GitHub，即完成发布；
+2. 使用方更新：
+   `python3 -m pip install --upgrade --force-reinstall "git+https://github.com/XiaonaMa910/claude-p.git"`；
+3. 稳定节点可打 tag（`git tag v0.1.4-mm1 && git push origin --tags`），CI 固定装 tag 保证可复现；
 
 ## License
 

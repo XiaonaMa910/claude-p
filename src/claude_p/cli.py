@@ -9,8 +9,8 @@ Compatibility target:
 - Same line-oriented JSON transport.
 - Same core event families: system init, stream_event message_start,
   content_block_start/delta/stop, assistant, message_delta, message_stop, result.
-- Usage/cost/tool events are best-effort placeholders because the interactive
-  TUI does not expose a machine-readable protocol.
+- Usage, cost, model and rate-limit fields carry real values read from Claude
+  Code's session JSONL and statusline payload. Tool events are not replayed.
 """
 
 from __future__ import annotations
@@ -1161,7 +1161,7 @@ def main() -> int:
                 "timed_out": timed_out,
                 "exit_code": exit_code,
                 "extraction_confidence": "high" if persisted else ("medium" if answer else "none"),
-                "compatibility_note": "Shape-compatible with claude -p stream-json core events; usage/cost/tool events are best-effort because TUI has no machine protocol.",
+                "compatibility_note": "Shape-compatible with claude -p stream-json core events; usage/cost/model/rate-limit are read from Claude Code's session JSONL and statusline payload; tool events are not replayed.",
             },
         }
     )
