@@ -40,6 +40,16 @@ SUBSCRIPTION_BACKEND_ENV_OVERRIDES = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
 )
+# Markers a parent Claude Code session injects into child processes. If the
+# spawned TUI inherits these it treats itself as a nested child session and —
+# critically — CLAUDE_CODE_CHILD_SESSION=1 disables session JSONL persistence,
+# which claude-p depends on for final text, usage and cost. Always strip them.
+NESTED_CLAUDE_SESSION_ENV = (
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+)
 VARIADIC_PROMPT_ATTRS = (
     "tools",
     "allowed_tools",
@@ -184,15 +194,27 @@ def classify_interactive_block(text: str) -> str | None:
         or ("quicksafetycheck" in compact and ("itrustthisfolder" in compact or "accessingworkspace" in compact))
     ):
         return "workspace_trust_blocked"
+    if "bypasspermissionsmode" in compact and "iaccept" in compact:
+        # One-time TUI consent dialog for --dangerously-skip-permissions.
+        # Accept it manually once per machine, or run claude-p with
+        # --accept-bypass-permissions to record the consent automatically.
+        return "bypass_permissions_dialog_blocked"
     if "permission" in low and ("allow" in low or "deny" in low):
         return "tool_approval_blocked"
     return None
 
 
-def build_usage(output_text: str) -> dict:
-    # The TUI does not expose reliable token/cost data. Keep shape-compatible
-    # fields with null/zero values and mark the source in result metadata.
+def build_usage(output_text: str, persisted_usage: dict | None = None) -> dict:
+    """Build the result-event usage dict.
+
+    Claude Code persists the real Anthropic API usage of every assistant turn in
+    the session JSONL. When available, forward the final turn's usage verbatim —
+    this matches native `claude -p`, whose result.usage is the last main-loop API
+    call's usage. Fall back to the legacy placeholder shape otherwise.
+    """
     approx_output_tokens = max(1, len(output_text.split()))
+    if isinstance(persisted_usage, dict) and persisted_usage.get("input_tokens") is not None:
+        return dict(persisted_usage)
     return {
         "input_tokens": None,
         "cache_creation_input_tokens": None,
@@ -218,11 +240,189 @@ def build_usage(output_text: str) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Real usage / cost / rate-limit reconstruction.
+#
+# Native `claude -p` reports total_cost_usd, usage and modelUsage on the result
+# event, and emits rate_limit_event with rate_limit_info. The interactive TUI
+# has no machine protocol, but two byproducts carry the same data:
+#   1. The session JSONL: every assistant turn line holds the API `usage` and
+#      `model`. NOTE: one API response is written as N lines (one per content
+#      block) with the SAME message id and usage — dedupe by id before summing.
+#   2. The statusline hook: Claude Code feeds it a JSON payload per refresh
+#      containing cost.total_cost_usd (Claude's own price — never priced
+#      locally) and rate_limits.{five_hour,seven_day}.{used_percentage,
+#      resets_at}. We inject a statusline command that dumps the latest
+#      payload to a temp file (unless the caller passed --settings).
+# ---------------------------------------------------------------------------
+
+
+def read_session_usage(session_id: str, since_iso: str, *, wait_seconds: float = 2.0) -> dict:
+    """Aggregate per-model token usage from the session JSONL, deduped by message id.
+
+    Tokens only — no price math here. Cost comes from Claude Code itself via the
+    statusline payload (cost.total_cost_usd), the same number native claude -p
+    reports; this wrapper never prices tokens with its own tables.
+
+    `since_iso` (ISO-8601 UTC) excludes turns persisted before this run started,
+    so --resume runs only report their own usage — matching native claude -p.
+    Returns {"modelUsage": {...}, "last_model": str|None}.
+    """
+    empty = {"modelUsage": {}, "last_model": None}
+    pattern = str(Path.home() / ".claude" / "projects" / "**" / f"{session_id}.jsonl")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        paths = [Path(p) for p in glob.glob(pattern, recursive=True)]
+        if paths or time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    if not paths:
+        return empty
+    path = max(paths, key=lambda p: p.stat().st_mtime)
+
+    # message id -> (model, usage); later lines for the same id overwrite so the
+    # final (complete) snapshot of each API response wins.
+    by_message: dict[str, tuple[str, dict]] = {}
+    last_model: str | None = None
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "assistant":
+                    continue
+                ts = event.get("timestamp")
+                if isinstance(ts, str) and ts < since_iso:
+                    continue
+                message = event.get("message")
+                if not isinstance(message, dict):
+                    continue
+                usage = message.get("usage")
+                if not isinstance(usage, dict):
+                    continue
+                msg_id = message.get("id") or event.get("requestId") or event.get("uuid")
+                model = message.get("model") or "unknown"
+                by_message[msg_id] = (model, usage)
+                last_model = model
+    except OSError:
+        return empty
+
+    model_usage: dict[str, dict] = {}
+    for model, usage in by_message.values():
+        bucket = model_usage.setdefault(
+            model,
+            {
+                "inputTokens": 0,
+                "outputTokens": 0,
+                "cacheReadInputTokens": 0,
+                "cacheCreationInputTokens": 0,
+                "webSearchRequests": 0,
+                "costUSD": None,
+            },
+        )
+        bucket["inputTokens"] += usage.get("input_tokens") or 0
+        bucket["outputTokens"] += usage.get("output_tokens") or 0
+        bucket["cacheReadInputTokens"] += usage.get("cache_read_input_tokens") or 0
+        bucket["cacheCreationInputTokens"] += usage.get("cache_creation_input_tokens") or 0
+        bucket["webSearchRequests"] += (usage.get("server_tool_use") or {}).get("web_search_requests") or 0
+    return {"modelUsage": model_usage, "last_model": last_model}
+
+
+def statusline_snapshot_path(session_id: str) -> Path:
+    import tempfile
+
+    return Path(tempfile.gettempdir()) / f"claude-p-status-{session_id}.json"
+
+
+def read_statusline_snapshot(session_id: str) -> dict:
+    """Read the latest statusline payload for this session.
+
+    Primary source: the snapshot file written by our injected statusline
+    command. Fallback: ~/.claude/usage.jsonl when the user's own statusline
+    config (which claude-p then doesn't override) appends payloads there.
+    """
+    path = statusline_snapshot_path(session_id)
+    try:
+        if path.exists() and path.stat().st_size > 0:
+            return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    usage_log = Path.home() / ".claude" / "usage.jsonl"
+    latest: dict = {}
+    try:
+        with usage_log.open() as f:
+            for line in f:
+                if session_id not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                data = record.get("data") or {}
+                if data.get("session_id") == session_id:
+                    latest = data
+    except OSError:
+        pass
+    return latest
+
+
+def build_rate_limit_info(snapshot: dict, *, rejected: bool) -> dict:
+    """Shape statusline rate_limits into native rate_limit_info.
+
+    Native shape: {"status": "allowed"|"rejected", "resetsAt": epoch,
+    "rateLimitType": "five_hour"|"seven_day", ...}. The statusline payload's
+    rate_limits.*.resets_at carries the exact same epoch the native event uses.
+    """
+    limits = snapshot.get("rate_limits") or {}
+    candidates = [
+        (name, info)
+        for name, info in limits.items()
+        if isinstance(info, dict) and info.get("resets_at")
+    ]
+    if not candidates:
+        return {"status": "rejected" if rejected else "unknown"}
+    name, info = max(candidates, key=lambda kv: kv[1].get("used_percentage") or 0)
+    return {
+        "status": "rejected" if rejected else "allowed",
+        "resetsAt": info.get("resets_at"),
+        "rateLimitType": name,
+        "used_percentage": info.get("used_percentage"),
+    }
+
+
+def ensure_bypass_permissions_accepted() -> None:
+    """Pre-accept the TUI's one-time Bypass Permissions dialog.
+
+    Native `claude -p --dangerously-skip-permissions` runs headless, but the
+    interactive TUI blocks on a one-time acceptance dialog (default: "No, exit")
+    until ~/.claude.json records bypassPermissionsModeAccepted. Only called when
+    the operator explicitly opts in via --accept-bypass-permissions.
+    """
+    path = Path.home() / ".claude.json"
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return
+    if data.get("bypassPermissionsModeAccepted") is True:
+        return
+    data["bypassPermissionsModeAccepted"] = True
+    tmp = path.with_name(".claude.json.claude-p-tmp")
+    try:
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
 def build_tui_env(args: argparse.Namespace) -> dict[str, str]:
     env = {**os.environ, "NO_COLOR": "1", "TERM": args.term}
     if not args.preserve_provider_env:
         for name in SUBSCRIPTION_BACKEND_ENV_OVERRIDES:
             env.pop(name, None)
+    for name in NESTED_CLAUDE_SESSION_ENV:
+        env.pop(name, None)
     return env
 
 
@@ -305,6 +505,13 @@ def read_persisted_assistant(session_id: str, *, require_terminal: bool = False)
 
 
 def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int | None, bool, float]:
+    # Opt-in only: silently flipping a consent flag in ~/.claude.json is a
+    # security-relevant side effect, so it requires this explicit wrapper flag
+    # in addition to --dangerously-skip-permissions itself.
+    if args.accept_bypass_permissions and (
+        args.dangerously_skip_permissions or args.allow_dangerously_skip_permissions
+    ):
+        ensure_bypass_permissions_accepted()
     cmd = ["claude", "--session-id", args.session_id]
 
     # Pass through options that the interactive `claude` entrypoint itself
@@ -345,7 +552,21 @@ def run_tui(args: argparse.Namespace, stream_json: bool) -> tuple[str, str, int 
     append_value(cmd, "--remote-control-session-name-prefix", args.remote_control_session_name_prefix)
     append_optional_value(cmd, "--resume", args.resume)
     append_value(cmd, "--setting-sources", args.setting_sources)
-    append_value(cmd, "--settings", args.settings)
+    # Inject a statusline that dumps Claude Code's per-refresh payload (cost +
+    # rate_limits) to a temp file, so the result/rate_limit events can report
+    # real data. Skipped when the caller supplies --settings — theirs wins.
+    if args.settings is None:
+        snapshot_path = statusline_snapshot_path(args.session_id)
+        injected = {
+            "statusLine": {
+                "type": "command",
+                "command": f"cat > {snapshot_path}",
+                "padding": 0,
+            }
+        }
+        cmd.extend(["--settings", json.dumps(injected)])
+    else:
+        append_value(cmd, "--settings", args.settings)
     append_flag(cmd, args.strict_mcp_config, "--strict-mcp-config")
     append_value(cmd, "--system-prompt", args.system_prompt)
     append_optional_value(cmd, "--tmux", args.tmux)
@@ -577,6 +798,15 @@ def main() -> int:
         help="Preserve Anthropic API/provider environment variables instead of stripping them for the subscription-backed TUI.",
     )
     parser.add_argument(
+        "--accept-bypass-permissions",
+        action="store_true",
+        help=(
+            "With --dangerously-skip-permissions: pre-record the TUI's one-time "
+            "Bypass Permissions consent in ~/.claude.json so headless runs don't "
+            "block on the dialog. Off by default because it flips a security consent."
+        ),
+    )
+    parser.add_argument(
         "--doctor",
         action="store_true",
         help="Print local installation diagnostics without calling the model.",
@@ -727,7 +957,40 @@ def main() -> int:
 
     failure = classify_failure(transcript, answer, timed_out)
     is_error = failure is not None
-    usage = build_usage(answer)
+
+    # Reconstruct what native claude -p reports natively: usage from the final
+    # assistant turn, modelUsage token sums over this run's API calls (deduped
+    # by message id), price and rate limits from Claude Code's own statusline
+    # payload — no locally computed prices.
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start - 30))
+    session_usage = read_session_usage(args.session_id, since_iso)
+    usage = build_usage(answer, persisted.get("usage") if persisted else None)
+    model_usage = session_usage["modelUsage"]
+    snapshot = read_statusline_snapshot(args.session_id)
+    # Price comes from Claude Code itself (statusline payload cost.total_cost_usd
+    # — the same number native claude -p puts in result.total_cost_usd). No local
+    # pricing tables: if Claude didn't report a cost, report None.
+    snapshot_cost = (snapshot.get("cost") or {}).get("total_cost_usd")
+    total_cost_usd = snapshot_cost if isinstance(snapshot_cost, (int, float)) and snapshot_cost > 0 else None
+    context_window_size = (snapshot.get("context_window") or {}).get("context_window_size")
+    for bucket in model_usage.values():
+        if context_window_size:
+            bucket["contextWindow"] = context_window_size
+    if total_cost_usd is not None and len(model_usage) == 1:
+        # Single-model run: Claude's session cost belongs to that model.
+        next(iter(model_usage.values()))["costUSD"] = total_cost_usd
+    # Resolve the real model id. The early init event could only echo the CLI
+    # alias (e.g. "haiku"); the session JSONL and the statusline payload carry
+    # what Claude Code actually ran (e.g. "claude-haiku-4-5-20251001").
+    if final_model == args.model:
+        resolved_model = session_usage["last_model"] or (snapshot.get("model") or {}).get("id")
+        if resolved_model:
+            final_model = resolved_model
+    rate_limit_info = build_rate_limit_info(snapshot, rejected=failure == "rate_limit")
+    try:
+        statusline_snapshot_path(args.session_id).unlink(missing_ok=True)
+    except OSError:
+        pass
     duration_ms = now_ms(start)
 
     if args.output_format == "text":
@@ -755,7 +1018,8 @@ def main() -> int:
                     "num_turns": 1,
                     "result": answer,
                     "session_id": args.session_id,
-                    "total_cost_usd": None,
+                    "total_cost_usd": total_cost_usd,
+                    "modelUsage": model_usage,
                     "usage": usage,
                     "terminal_reason": "completed" if not is_error else failure,
                     "interactive_tui_backend": {
@@ -774,6 +1038,30 @@ def main() -> int:
         )
         return 0 if not is_error else 2
 
+    if final_model != args.model:
+        # The first init event could only echo the CLI alias (emitted before the
+        # TUI launched). Re-emit init carrying the resolved model id so parsers
+        # that read the model from init (native claude -p puts the full id
+        # there) end up with the real value.
+        emit(
+            {
+                "type": "system",
+                "subtype": "init",
+                "cwd": args.cwd,
+                "session_id": args.session_id,
+                "tools": [],
+                "mcp_servers": [],
+                "model": final_model,
+                "permissionMode": args.permission_mode,
+                "apiKeySource": "interactive_tui_subscription",
+                "claude_code_version": None,
+                "output_style": "default",
+                "model_resolved": True,
+                "uuid": str(uuid.uuid4()),
+                "fast_mode_state": "off",
+            }
+        )
+
     emit(
         {
             "type": "assistant",
@@ -790,7 +1078,7 @@ def main() -> int:
                     "input_tokens": None,
                     "cache_creation_input_tokens": None,
                     "cache_read_input_tokens": None,
-                    "output_tokens": usage["output_tokens"],
+                    "output_tokens": usage.get("output_tokens"),
                     "service_tier": None,
                 },
                 "context_management": None,
@@ -819,8 +1107,8 @@ def main() -> int:
                     "input_tokens": None,
                     "cache_creation_input_tokens": None,
                     "cache_read_input_tokens": None,
-                    "output_tokens": usage["output_tokens"],
-                    "iterations": usage["iterations"],
+                    "output_tokens": usage.get("output_tokens"),
+                    "iterations": usage.get("iterations"),
                 },
                 "context_management": {"applied_edits": []},
             },
@@ -841,7 +1129,7 @@ def main() -> int:
     emit(
         {
             "type": "rate_limit_event",
-            "rate_limit_info": {"status": "unknown"},
+            "rate_limit_info": rate_limit_info,
             "session_id": args.session_id,
             "uuid": str(uuid.uuid4()),
         }
@@ -858,9 +1146,9 @@ def main() -> int:
             "result": answer,
             "stop_reason": "end_turn" if not is_error else None,
             "session_id": args.session_id,
-            "total_cost_usd": None,
+            "total_cost_usd": total_cost_usd,
             "usage": usage,
-            "modelUsage": {},
+            "modelUsage": model_usage,
             "permission_denials": [],
             "terminal_reason": "completed" if not is_error else failure,
             "fast_mode_state": "off",
